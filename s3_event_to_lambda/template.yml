@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Stack Send Mail
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: bucket-nutenvmaildev
+
+  MAIL:
+    Description: Mail para Suscripcion SNS
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: MAIL
+
+Resources:
+  #Creación de bucket S3
+  rS3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: data/ventas_canales_digitales_pruebas/data_rej/
+                  - Name: suffix
+                    Value: .csv
+            Function: !GetAtt rLambdaFunction.Arn
+
+  #Creación de Funcion Lambda
+  rLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "fnc-NutEnvMailDev"
+      Handler: "index.lambda_handler"
+      Runtime: "python3.10"
+      Role: !GetAtt rLambdaExecutionRole.Arn
+      Environment:
+        Variables: 
+          TopicArnSNS: !Ref rSnsTopic
+      Code:
+        ZipFile: |
+          import urllib.parse
+          import boto3
+          import os
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              try:   
+                  s3_presigned_url = s3.generate_presigned_url(
+                      ClientMethod='get_object',
+                      Params={
+                          'Bucket': bucket,
+                          'Key': key
+                      },
+                      ExpiresIn=86400
+                  )
+                  
+                  topic_arn_sns = os.environ['TopicArnSNS']  
+                  subject = '[Nutresa AIDA]Codes Rejectados Clientes Digitales'
+                  message = s3_presigned_url
+                  sns.publish(
+                      TopicArn=topic_arn_sns,
+                      Subject=subject,
+                      Message= "Estimados,\n\nSe envia la URL de descarga:\n\n" + message
+                  )
+                  
+              except Exception as e:
+                  print(e)
+                  raise e
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref rLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${BucketName}
+
+  #Creación de rol de IAM que se asociará la función Lambda para que pueda tener permisos a SNS y CloudWatch Logs
+  rLambdaExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: Role-Lambda-NutEnvMailDev
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        Path: "/"
+        Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:CreateLogGroup
+              Resource:
+                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+            - Effect: Allow
+              Action:
+                - s3:Get*
+              Resource:
+                - !Sub arn:aws:s3:::${BucketName}
+                - !Sub arn:aws:s3:::${BucketName}/*
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource:
+                - !Ref rSnsTopic
+
+  #Creación de tópico en SNS
+  rSnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      TopicName: "sns-NutEnvMailDev"
+  
+  #Creación de suscripción al tópico de SNS
+  rSubscription:
+    Type: "AWS::SNS::Subscription"
+    DependsOn: rSnsTopic
+    Properties:
+      TopicArn: !Ref rSnsTopic
+      Endpoint: !Ref MAIL
+      Protocol: email
+
+Outputs:
+  S3BucketName:
+    Value: !Ref rS3Bucket
+  LambdaFunctionArn:
+    Value: !GetAtt rLambdaFunction.Arn
+  SNSTopicArn:
+    Value: !Ref rSnsTopic
